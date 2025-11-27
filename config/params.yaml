@@ -1,0 +1,13 @@
+install_area_detection_node:
+  ros__parameters:
+    depth_topic: "/depth"
+    right_topic: "/image_rect"
+    vis: false
+    threshold:
+      top: 1500 # in millimeters
+      bottom: 1100
+    roi_coordinates:
+      left_top: [545, 237, 640, 327] # x1, y1, x2, y2
+      right_top: [740, 237, 835, 327]
+      left_bottom: [550, 415, 635, 491]
+      right_bottom: [745, 415, 830, 491]
