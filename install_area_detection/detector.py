@@ -54,7 +54,7 @@ class InstallAreaDetection(Node):
             self.create_subscription(Image, depth_topic, self.detect_without_vis, 10)
             self.get_logger().info(f'Node Started (HEADLESS MODE). Listening to {depth_topic}')
 
-    def _get_cv_depth(self, depth_msg: Image) -> np.ndarray[float]:
+    def _get_cv_depth(self, depth_msg: Image) -> np.ndarray:
         """
         Convert ROS Depth Image to CV2 format
         

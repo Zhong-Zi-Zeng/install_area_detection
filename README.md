@@ -17,8 +17,9 @@ This package provides tools and algorithms to detect and recognize suitable area
 ### 1. Clone the repository
 
 ```bash
+mkdir -p ~/ros2_ws/src
 cd ~/ros2_ws/src
-https://github.com/Zhong-Zi-Zeng/install_area_detection.git
+git clone https://github.com/Zhong-Zi-Zeng/install_area_detection.git
 ```
 
 ### 2. Install dependencies
@@ -47,7 +48,7 @@ source ~/ros2_ws/install/setup.bash
 ### Launch with parameters
 
 ```bash
-ros2 launch install_area_detection detection_launch.py
+ros2 launch install_area_detection detector.launch.py
 ```
 
 ## Configuration
