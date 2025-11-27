@@ -75,7 +75,7 @@ class InstallAreaDetection(Node):
             return None
 
     def _analyze_roi(self, 
-                     cv_depth: np.ndarray[float], 
+                     cv_depth: np.ndarray, 
                      name: str, 
                      coords: list[int]) -> tuple[str, float, tuple, tuple]:
         """
