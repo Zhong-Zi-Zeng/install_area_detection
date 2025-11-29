@@ -2,6 +2,7 @@ install_area_detection_node:
   ros__parameters:
     depth_topic: "/depth"
     right_topic: "/image_rect"
+    camera_info_topic: "/camera_info_rect"
     vis: true
     shrink_ratio: 0.3
     bracket: # in millimeters

@@ -1,11 +1,11 @@
-from typing import Union
+from typing import Union, Tuple
 
 import rclpy
 import cv2
 import numpy as np
 import message_filters
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo 
 from cv_bridge import CvBridge
 
 
@@ -20,6 +20,8 @@ class InstallAreaDetection(Node):
         # Get parameters
         depth_topic = self.get_parameter("depth_topic").value
         rgb_topic = self.get_parameter("rgb_topic").value
+        camera_info_topic = self.get_parameter("camera_info_topic").value
+        
         self.vis = self.get_parameter("vis").value
         self.top_threshold = self.get_parameter("threshold.top").value
         self.bottom_threshold = self.get_parameter("threshold.bottom").value
@@ -27,6 +29,9 @@ class InstallAreaDetection(Node):
         self.bracket_width = self.get_parameter("bracket.width").value
         self.shrink_ratio = self.get_parameter("shrink_ratio").value
 
+        # Initialize camera intrinsics
+        self.camera_intrinsics = None 
+        
         # April Tag Detector Initialization
         self.april_detection_dict = cv2.aruco.Dictionary_get(
             cv2.aruco.DICT_APRILTAG_36h11
@@ -43,6 +48,12 @@ class InstallAreaDetection(Node):
         # Create subscribers
         self.depth_sub = message_filters.Subscriber(self, Image, depth_topic)
         self.rgb_sub = message_filters.Subscriber(self, Image, rgb_topic)
+        self.camera_info_sub = self.create_subscription(
+            CameraInfo, 
+            camera_info_topic, 
+            self.camera_info_callback, 
+            10
+        )
 
         # Use ApproximateTimeSynchronizer for syncing depth and RGB
         self.ts = message_filters.ApproximateTimeSynchronizer(
@@ -53,37 +64,126 @@ class InstallAreaDetection(Node):
             f"InstallAreaDetection Node Started. Listening to {rgb_topic} and {depth_topic}"
         )
 
+    def camera_info_callback(self, msg: CameraInfo) :
+        """
+        Callback function to store camera intrinsics
+        """
+        if self.camera_intrinsics is None:
+            self.camera_intrinsics = {
+                'fx': msg.k[0],
+                'fy': msg.k[4],
+                'cx': msg.k[2],
+                'cy': msg.k[5]
+            }
+            self.get_logger().info(f"Camera Intrinsics Received: {self.camera_intrinsics}")
+    
+    def detect(self, depth_msg: Image, rgb_msg: Image):
+
+        try:
+            cv_rgb = self.bridge.imgmsg_to_cv2(
+                rgb_msg, desired_encoding="bgr8")
+            cv_depth = self.bridge.imgmsg_to_cv2(
+                depth_msg, desired_encoding="passthrough")
+
+            if depth_msg.encoding == "32FC1":
+                cv_depth = cv_depth * 1000.0
+
+        except Exception as e:
+            self.get_logger().error(f"Failed to convert image: {e}")
+            return
+
+        corners = self._detect_apriltag(cv_rgb)
+
+        if corners is None:
+            return
+
+        # Determine status and publish 3D position of uninstall area
+        uninstall_position = []
+
+        rois_polygons_dict = self._analyze_roi(corners)
+
+        for key, roi in rois_polygons_dict.items():
+            mask = np.zeros(cv_depth.shape, dtype=np.uint8)
+            cv2.fillPoly(mask, [roi], color=1)
+
+            roi_depth_values = cv_depth[mask == 1]
+            roi_depth_values = roi_depth_values[roi_depth_values > 0]
+
+            # If no depth value in ROI, skip
+            if roi_depth_values.size == 0:
+                continue
+
+            threshold = self.top_threshold if 'top' in key else self.bottom_threshold
+
+            if np.mean(roi_depth_values) > threshold:
+                status = "Unstalled"
+                color = [0, 0, 255]
+                
+                M_moments = cv2.moments(roi)
+                cX = int(M_moments["m10"] / M_moments["m00"])
+                cY = int(M_moments["m01"] / M_moments["m00"])
+                                
+            else:
+                status = "Installed"
+                color = [0, 255, 0]
+
+            if self.vis:
+                cv2.polylines(cv_rgb, [roi], True, color, 2, cv2.LINE_AA)
+
+                text = f"{status}, {np.mean(roi_depth_values):.2f} mm"
+                font_scale = 0.6
+                thickness = 1
+                font = cv2.FONT_HERSHEY_SIMPLEX
+
+                (text_w, text_h), baseline = cv2.getTextSize(
+                    text, font, font_scale, thickness)
+
+                x, y = roi[0][0][0], roi[0][0][1]
+                cv2.rectangle(cv_rgb, (x, y - text_h - 10),
+                                (x + text_w, y), color, -1)
+                cv2.putText(cv_rgb, text, (x, y - 5), font, font_scale,
+                            (255, 255, 255), thickness, cv2.LINE_AA)
+
+        cv2.imshow("Detection Result", cv_rgb)
+        cv2.waitKey(1)
+    
+    
+    def _pixel_to_camera(self, u, v, depth_mm) -> Tuple[float, float, float]:
+        """
+        Convert pixel coordinates to camera coordinates
+        
+        Arguments:
+            u: x pixel coordinate
+            v: y pixel coordinate
+            depth_mm: depth in millimeters
+            
+        Returns:
+            x: x coordinate in meters
+            y: y coordinate in meters
+            z: z coordinate in meters
+        """
+        fx = self.camera_intrinsics['fx']
+        fy = self.camera_intrinsics['fy']
+        cx = self.camera_intrinsics['cx']
+        cy = self.camera_intrinsics['cy']
+
+        z_m = depth_mm / 1000.0 
+        
+        x_m = (u - cx) * z_m / fx
+        y_m = (v - cy) * z_m / fy
+        
+        return (x_m, y_m, z_m)
+    
     def _declare_parameters(self):
         self.declare_parameter("depth_topic", "/depth")
         self.declare_parameter("rgb_topic", "/image_rect")
+        self.declare_parameter("camera_info_topic", "/camera_info_rect")
         self.declare_parameter("vis", True)
         self.declare_parameter("threshold.top", 1500)
         self.declare_parameter("threshold.bottom", 1100)
         self.declare_parameter("bracket.height", 460)
         self.declare_parameter("bracket.width", 500)
         self.declare_parameter("shrink_ratio", 0.3)
-
-    def _get_cv_depth(self, depth_msg: Image) -> np.ndarray:
-        """
-        Convert ROS Depth Image to CV2 format
-
-        Arguments:
-            depth_msg: sensor_msgs/Image
-
-        Returns:
-            cv_depth: numpy array of depth values in mm
-        """
-        try:
-            cv_depth = self.bridge.imgmsg_to_cv2(
-                depth_msg, desired_encoding="passthrough"
-            )
-            # Transform depth to mm if needed
-            if depth_msg.encoding == "32FC1":
-                cv_depth = cv_depth * 1000.0
-            return cv_depth
-        except Exception as e:
-            self.get_logger().error(f"CV Bridge Error: {e}")
-            return None
 
     def _analyze_roi(self, corners_dict: dict[str, np.ndarray]) -> list[np.ndarray]:
         """
@@ -157,76 +257,7 @@ class InstallAreaDetection(Node):
             rois_polygons_dict[key] = projected_pts.astype(int)
 
         return rois_polygons_dict
-
-    def detect(self, depth_msg: Image, rgb_msg: Image):
-        # Get RGB Image
-        try:
-            cv_rgb = self.bridge.imgmsg_to_cv2(
-                rgb_msg, desired_encoding="bgr8")
-        except Exception as e:
-            self.get_logger().error(f"CV Bridge RGB Error: {e}")
-            return
-
-        # Get Depth Image
-        try:
-            cv_depth = self.bridge.imgmsg_to_cv2(
-                depth_msg, desired_encoding="passthrough"
-            )
-            # Transform depth to mm if needed
-            if depth_msg.encoding == "32FC1":
-                cv_depth = cv_depth * 1000.0
-        except Exception as e:
-            self.get_logger().error(f"CV Bridge Error: {e}")
-            return
-
-        corners = self._detect_apriltag(cv_rgb)
-
-        if corners is None:
-            return
-
-        # Check depth in each ROI and determine status
-        rois_polygons_dict = self._analyze_roi(corners)
-
-        # Determine status and publish 3D position of uninstall area
-        uninstall_position = []
-
-        for key, roi in rois_polygons_dict.items():
-            mask = np.zeros(cv_depth.shape, dtype=np.uint8)
-            cv2.fillPoly(mask, [roi], color=1)
-
-            roi_depth_values = cv_depth[mask == 1]
-            roi_depth_values = roi_depth_values[roi_depth_values > 0]
-            
-            # If no depth value in ROI, skip
-            if roi_depth_values.size == 0:
-                continue
-                
-            threshold = self.top_threshold if 'top' in key else self.bottom_threshold
-            
-            if np.mean(roi_depth_values) > threshold:
-                status = "Unstalled"
-                color = [0, 0, 255]
-            else:
-                status = "Installed" 
-                color = [0, 255, 0]
-            
-            if self.vis:
-                cv2.polylines(cv_rgb, [roi], True, color, 2, cv2.LINE_AA)
-
-                text = f"{status}, {np.mean(roi_depth_values):.2f} mm"
-                font_scale = 0.6
-                thickness = 1
-                font = cv2.FONT_HERSHEY_SIMPLEX
-
-                (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-                
-                x, y = roi[0][0][0], roi[0][0][1]
-                cv2.rectangle(cv_rgb, (x, y - text_h - 10), (x + text_w, y), color, -1)
-                cv2.putText(cv_rgb, text, (x, y - 5), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)           
-
-        cv2.imshow("Detection Result", cv_rgb)
-        cv2.waitKey(1)
-
+    
     def _detect_apriltag(self, cv_rgb: np.ndarray) -> Union[dict[np.ndarray], None]:
         """
         Detect AprilTags in the RGB image
