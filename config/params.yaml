@@ -3,6 +3,7 @@ install_area_detection_node:
     depth_topic: "/depth"
     right_topic: "/image_rect"
     camera_info_topic: "/camera_info_rect"
+    pose_topic: "/install_area/target_pose"
     vis: true
     shrink_ratio: 0.3
     bracket: # in millimeters
