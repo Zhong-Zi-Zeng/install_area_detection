@@ -1,165 +1,273 @@
+from typing import Union
+
 import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
 import cv2
 import numpy as np
 import message_filters
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+
 
 class InstallAreaDetection(Node):
     def __init__(self):
-        super().__init__('install_area_detection_node')
+        super().__init__("install_area_detection_node")
         self.bridge = CvBridge()
 
         # Declare parameters
-        self.declare_parameter('depth_topic', '/depth')
-        self.declare_parameter('rgb_topic', '/image_rect')
-        self.declare_parameter('vis', True)
-        self.declare_parameter('threshold.top', 1500)
-        self.declare_parameter('threshold.bottom', 1100)
-        
-        self.declare_parameter('roi_coordinates.left_top', [545, 237, 640, 327])
-        self.declare_parameter('roi_coordinates.right_top', [740, 237, 835, 327])
-        self.declare_parameter('roi_coordinates.left_bottom', [550, 415, 635, 491])
-        self.declare_parameter('roi_coordinates.right_bottom', [745, 415, 830, 491])
+        self._declare_parameters()
 
         # Get parameters
-        depth_topic = self.get_parameter('depth_topic').value
-        rgb_topic = self.get_parameter('rgb_topic').value
-        vis = self.get_parameter('vis').value
-        self.top_threshold = self.get_parameter('threshold.top').value
-        self.bottom_threshold = self.get_parameter('threshold.bottom').value
-        
-        self.rois = {
-            'left_top': self.get_parameter('roi_coordinates.left_top').value,
-            'right_top': self.get_parameter('roi_coordinates.right_top').value,
-            'left_bottom': self.get_parameter('roi_coordinates.left_bottom').value,
-            'right_bottom': self.get_parameter('roi_coordinates.right_bottom').value,
-        }
+        depth_topic = self.get_parameter("depth_topic").value
+        rgb_topic = self.get_parameter("rgb_topic").value
+        self.vis = self.get_parameter("vis").value
+        self.top_threshold = self.get_parameter("threshold.top").value
+        self.bottom_threshold = self.get_parameter("threshold.bottom").value
+        self.bracket_height = self.get_parameter("bracket.height").value
+        self.bracket_width = self.get_parameter("bracket.width").value
+        self.shrink_ratio = self.get_parameter("shrink_ratio").value
+
+        # April Tag Detector Initialization
+        self.april_detection_dict = cv2.aruco.Dictionary_get(
+            cv2.aruco.DICT_APRILTAG_36h11
+        )
+        self.april_detection_parameters = cv2.aruco.DetectorParameters_create()
+        self.april_detection_parameters.minMarkerPerimeterRate = 0.01
+        self.april_detection_parameters.cornerRefinementWinSize = 5
+        self.april_detection_parameters.cornerRefinementMaxIterations = 30
+        self.april_detection_parameters.cornerRefinementMinAccuracy = 0.1
+        self.april_detection_parameters.cornerRefinementMethod = (
+            cv2.aruco.CORNER_REFINE_SUBPIX
+        )
 
         # Create subscribers
-        if vis:
-            self.depth_sub = message_filters.Subscriber(self, Image, depth_topic)
-            self.rgb_sub = message_filters.Subscriber(self, Image, rgb_topic)
-            
-            # Use ApproximateTimeSynchronizer for syncing depth and RGB
-            self.ts = message_filters.ApproximateTimeSynchronizer(
-                [self.depth_sub, self.rgb_sub], 
-                queue_size=10, 
-                slop=0.1
-            )
-            self.ts.registerCallback(self.detect_with_vis)
-            self.get_logger().info(f'Node Started (VIS MODE). Listening to {rgb_topic} and {depth_topic}')
-        else:
-            self.create_subscription(Image, depth_topic, self.detect_without_vis, 10)
-            self.get_logger().info(f'Node Started (HEADLESS MODE). Listening to {depth_topic}')
+        self.depth_sub = message_filters.Subscriber(self, Image, depth_topic)
+        self.rgb_sub = message_filters.Subscriber(self, Image, rgb_topic)
+
+        # Use ApproximateTimeSynchronizer for syncing depth and RGB
+        self.ts = message_filters.ApproximateTimeSynchronizer(
+            [self.depth_sub, self.rgb_sub], queue_size=10, slop=0.1
+        )
+        self.ts.registerCallback(self.detect)
+        self.get_logger().info(
+            f"InstallAreaDetection Node Started. Listening to {rgb_topic} and {depth_topic}"
+        )
+
+    def _declare_parameters(self):
+        self.declare_parameter("depth_topic", "/depth")
+        self.declare_parameter("rgb_topic", "/image_rect")
+        self.declare_parameter("vis", True)
+        self.declare_parameter("threshold.top", 1500)
+        self.declare_parameter("threshold.bottom", 1100)
+        self.declare_parameter("bracket.height", 460)
+        self.declare_parameter("bracket.width", 500)
+        self.declare_parameter("shrink_ratio", 0.3)
 
     def _get_cv_depth(self, depth_msg: Image) -> np.ndarray:
         """
         Convert ROS Depth Image to CV2 format
-        
+
         Arguments:
             depth_msg: sensor_msgs/Image
-        
+
         Returns:
             cv_depth: numpy array of depth values in mm
         """
         try:
-            cv_depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+            cv_depth = self.bridge.imgmsg_to_cv2(
+                depth_msg, desired_encoding="passthrough"
+            )
             # Transform depth to mm if needed
-            if depth_msg.encoding == '32FC1':
+            if depth_msg.encoding == "32FC1":
                 cv_depth = cv_depth * 1000.0
             return cv_depth
         except Exception as e:
-            self.get_logger().error(f'CV Bridge Error: {e}')
+            self.get_logger().error(f"CV Bridge Error: {e}")
             return None
 
-    def _analyze_roi(self, 
-                     cv_depth: np.ndarray, 
-                     name: str, 
-                     coords: list[int]) -> tuple[str, float, tuple, tuple]:
+    def _analyze_roi(self, corners_dict: dict[str, np.ndarray]) -> list[np.ndarray]:
         """
-        Analyze a single ROI and determine its state
-        
+        Analyze ROIs based on detected corners and return polygons for each ROI
+
         Arguments:
-            cv_depth: numpy array of depth values in mm
-            name: str, name of the ROI
-            coords: list of 4 ints, [x1, y1, x2, y2]
-        
+            corners_dict:
+                dict of detected corner positions. Keys are 'tl', 'tr', 'bl', 'br'. Each value is a numpy array of shape (2,).
+            shrink_ratio:
+                ratio to shrink the ROI boxes. Larger value means smaller boxes. Default is 0.3.
+
         Returns:
-            state: str, "INSTALLED", "EMPTY", or "Unknown"
-            avg_depth: float, average depth in mm
-            color: tuple, BGR color for visualization
-            rect_coords: tuple, (x1, y1, x2, y2) for drawing            
+            rois: list of ROI polygons as numpy arrays of shape (4, 1, 2)
         """
-        x1, y1, x2, y2 = coords
-        
-        # Determine threshold based on ROI position
-        threshold = self.top_threshold if 'top' in name else self.bottom_threshold
-        
-        # Avoid out-of-bounds (Safety check)
-        h, w = cv_depth.shape
-        x1, x2 = max(0, x1), min(w, x2)
-        y1, y2 = max(0, y1), min(h, y2)
+        # Define source points for perspective transform
+        W, H = self.bracket_width, self.bracket_height
+        src_pts = np.array(
+            [
+                [0, 0],  # top-left
+                [W, 0],  # top-right
+                [0, H],  # bottom-left
+                [W, H],  # bottom-right
+            ],
+            dtype=np.float32,
+        )
 
-        roi_depth = cv_depth[y1:y2, x1:x2]
-        valid_pixels = roi_depth[roi_depth > 0]
-        
-        # Determine state
-        if valid_pixels.size == 0:
-            avg_depth = 9999.0
-            state = "Unknown"
-            color = (0, 255, 255) # Yellow
-        else:
-            avg_depth = np.mean(valid_pixels)
-            if avg_depth < threshold:
-                state = "INSTALLED"
-                color = (0, 255, 0) # Green
-            else:
-                state = "EMPTY"
-                color = (0, 0, 255) # Red
-                
-        return state, avg_depth, color, (x1, y1, x2, y2)
+        # Define destination points from detected corners
+        dst_pts = np.array(
+            [
+                corners_dict["tl"],
+                corners_dict["tr"],
+                corners_dict["bl"],
+                corners_dict["br"],
+            ],
+            dtype=np.float32,
+        )
 
-    def detect_with_vis(self, depth_msg: Image, rgb_msg: Image):
-        """
-        Visualization Mode: Draw rectangles on RGB image
-        """
-        cv_depth = self._get_cv_depth(depth_msg)
-        if cv_depth is None: return
+        # Calculate perspective transform
+        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
 
+        # Calculate padded box dimensions
+        half_w, half_h = W // 2, H // 2
+        pad_w = int(half_w * self.shrink_ratio)
+        pad_h = int(half_h * self.shrink_ratio)
+
+        # Define ideal boxes with padding
+        ideal_boxes_dict = {
+            "top-left": [0 + pad_w, 0 + pad_h, half_w - pad_w, half_h - pad_h],
+            "top-right": [half_w + pad_w, 0 + pad_h, W - pad_w, half_h - pad_h],
+            "buttom-left": [0 + pad_w, half_h + pad_h, half_w - pad_w, H - pad_h],
+            "buttom-right": [half_w + pad_w, half_h + pad_h, W - pad_w, H - pad_h],
+        }
+
+        # Project ideal boxes to image plane
+        rois_polygons_dict = {}
+
+        for key, box in ideal_boxes_dict.items():
+            bx1, by1, bx2, by2 = box
+
+            box_pts = np.array(
+                [
+                    [[bx1, by1]],  # top-left
+                    [[bx2, by1]],  # top-right
+                    [[bx2, by2]],  # bottom-right
+                    [[bx1, by2]],  # bottom-left
+                ],
+                dtype=np.float32,
+            )
+
+            projected_pts = cv2.perspectiveTransform(box_pts, M)
+            rois_polygons_dict[key] = projected_pts.astype(int)
+
+        return rois_polygons_dict
+
+    def detect(self, depth_msg: Image, rgb_msg: Image):
+        # Get RGB Image
         try:
-            cv_rgb = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
+            cv_rgb = self.bridge.imgmsg_to_cv2(
+                rgb_msg, desired_encoding="bgr8")
         except Exception as e:
-            self.get_logger().error(f'CV Bridge RGB Error: {e}')
+            self.get_logger().error(f"CV Bridge RGB Error: {e}")
             return
-        
-        for name, coords in self.rois.items():
-            state, avg_depth, color, (x1, y1, x2, y2) = self._analyze_roi(cv_depth, name, coords)
-            
-            cv2.rectangle(cv_rgb, (x1, y1), (x2, y2), color, 2)
-            
-            label = f"{state} ({avg_depth:.0f}mm)"
-            (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
 
-            cv2.rectangle(cv_rgb, (x1, y1 - 20), (x1 + text_w, y1), color, -1)
-            cv2.putText(cv_rgb, label, (x1, y1 - 5), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Get Depth Image
+        try:
+            cv_depth = self.bridge.imgmsg_to_cv2(
+                depth_msg, desired_encoding="passthrough"
+            )
+            # Transform depth to mm if needed
+            if depth_msg.encoding == "32FC1":
+                cv_depth = cv_depth * 1000.0
+        except Exception as e:
+            self.get_logger().error(f"CV Bridge Error: {e}")
+            return
+
+        corners = self._detect_apriltag(cv_rgb)
+
+        if corners is None:
+            return
+
+        # Check depth in each ROI and determine status
+        rois_polygons_dict = self._analyze_roi(corners)
+
+        # Determine status and publish 3D position of uninstall area
+        uninstall_position = []
+
+        for key, roi in rois_polygons_dict.items():
+            mask = np.zeros(cv_depth.shape, dtype=np.uint8)
+            cv2.fillPoly(mask, [roi], color=1)
+
+            roi_depth_values = cv_depth[mask == 1]
+            roi_depth_values = roi_depth_values[roi_depth_values > 0]
             
+            # If no depth value in ROI, skip
+            if roi_depth_values.size == 0:
+                continue
+                
+            threshold = self.top_threshold if 'top' in key else self.bottom_threshold
+            
+            if np.mean(roi_depth_values) > threshold:
+                status = "Unstalled"
+                color = [0, 0, 255]
+            else:
+                status = "Installed" 
+                color = [0, 255, 0]
+            
+            if self.vis:
+                cv2.polylines(cv_rgb, [roi], True, color, 2, cv2.LINE_AA)
+
+                text = f"{status}, {np.mean(roi_depth_values):.2f} mm"
+                font_scale = 0.6
+                thickness = 1
+                font = cv2.FONT_HERSHEY_SIMPLEX
+
+                (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+                
+                x, y = roi[0][0][0], roi[0][0][1]
+                cv2.rectangle(cv_rgb, (x, y - text_h - 10), (x + text_w, y), color, -1)
+                cv2.putText(cv_rgb, text, (x, y - 5), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)           
+
         cv2.imshow("Detection Result", cv_rgb)
         cv2.waitKey(1)
-        
-    def detect_without_vis(self, depth_msg: Image):
-        """
 
+    def _detect_apriltag(self, cv_rgb: np.ndarray) -> Union[dict[np.ndarray], None]:
         """
-        cv_depth = self._get_cv_depth(depth_msg)
-        if cv_depth is None: return
-        
-        for name, coords in self.rois.items():
-            state, avg_depth, _, _ = self._analyze_roi(cv_depth, name, coords)
-            
-            self.get_logger().info(f'ROI: {name}, State: {state}, Avg Depth: {avg_depth:.0f}mm')
+        Detect AprilTags in the RGB image
+
+        Arguments:
+            cv_rgb: numpy array of the RGB image
+
+        Returns:
+            corners:
+                left-top, right-top, right-bottom, left-bottom corne positions
+                as a dict of numpy arrays with shape (2,)
+        """
+        gray = cv2.cvtColor(cv_rgb, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = cv2.aruco.detectMarkers(
+            gray, self.april_detection_dict, parameters=self.april_detection_parameters
+        )
+
+        # If exactly 4 markers are detected
+        if len(corners) != 4:
+            return
+
+        # Resort corners based on marker positions. left-top, right-top, right-bottom, left-bottom
+        centers = []
+        for c in corners:
+            centers.append(np.mean(c[0], axis=0))  # (x, y)
+
+        pts = np.array(centers)
+
+        s = pts.sum(axis=1)
+        tl = pts[np.argmin(s)]
+        br = pts[np.argmax(s)]
+
+        diff = np.diff(pts, axis=1)
+        tr = pts[np.argmin(diff)]
+        bl = pts[np.argmax(diff)]
+
+        if self.vis:
+            cv2.aruco.drawDetectedMarkers(cv_rgb, corners, ids)
+
+        return {"tl": tl, "tr": tr, "bl": bl, "br": br}
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -171,5 +279,6 @@ def main(args=None):
     node.destroy_node()
     rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
