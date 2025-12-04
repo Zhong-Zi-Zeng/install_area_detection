@@ -1,10 +1,10 @@
 from typing import Union, Tuple
+from enum import Enum
 
 import rclpy
 import cv2
 import numpy as np
 import message_filters
-import tf2_ros
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PointStamped, PoseArray, Pose
@@ -12,6 +12,10 @@ from tf2_ros import Buffer, TransformListener
 from tf2_geometry_msgs import do_transform_point
 from cv_bridge import CvBridge
 
+
+class InstallStatus(Enum):
+    EMPTY = 'Empty'
+    OCCUPIED = 'Occupied'
 
 class InstallAreaDetection(Node):
     def __init__(self):
@@ -140,7 +144,7 @@ class InstallAreaDetection(Node):
             threshold = self.top_threshold if 'top' in key else self.bottom_threshold
 
             if np.mean(roi_depth_values) > threshold:
-                status = "Unstalled"
+                status = InstallStatus.EMPTY
 
                 tx, ty, tz = theoretical_3d_pt
                 p_cam = PointStamped()
@@ -157,14 +161,14 @@ class InstallAreaDetection(Node):
 
                 pose_array_msg.poses.append(pose)
             else:
-                status = "Installed"
+                status = InstallStatus.OCCUPIED
 
             if self.vis:
-                color = [0, 0, 255] if status == "Unstalled" else [0, 255, 0]
+                color = [0, 0, 255] if status == InstallStatus.EMPTY else [0, 255, 0]
 
                 cv2.polylines(cv_rgb, [roi], True, color, 2, cv2.LINE_AA)
 
-                text = f"{status}, {np.mean(roi_depth_values):.2f} mm"
+                text = f"{status.value}, {np.mean(roi_depth_values):.2f} mm"
                 font_scale = 0.6
                 thickness = 1
                 font = cv2.FONT_HERSHEY_SIMPLEX
