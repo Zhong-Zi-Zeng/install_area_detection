@@ -58,12 +58,13 @@ You can customize the detection parameters by modifying the configuration file l
 ## Topics
 
 ### Published Topics
+- `/install_area/target_pose`: Target pose topic. The type is `geometry_msgs/PoseArray`.
 
  
 ### Subscribed Topics
 
-- `/depth`: Depth image topic
-- `/image_rect`: RGB image topic
+- `/depth`: Depth image topic. The type is `sensor_msgs/Image`.
+- `/image_rect`: RGB image topic. The type is `sensor_msgs/Image`.
 
 
 ## Contact
